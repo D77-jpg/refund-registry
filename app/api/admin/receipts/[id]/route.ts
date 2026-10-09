@@ -1,13 +1,16 @@
 import { NextRequest } from 'next/server';
+import { unstable_noStore as noStore } from 'next/cache';
 import { getRefundById } from '@/lib/db';
 import { isAuthenticated } from '@/lib/auth';
 import { json } from '@/lib/http';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
+export const fetchCache = 'force-no-store';
 
 /** 管理后台查看收款码（需登录，避免收款码被外部抓取） */
 export async function GET(_req: NextRequest, { params }: { params: { id: string } }) {
+  noStore();
   if (!isAuthenticated()) return json({ ok: false, errors: ['未登录'] }, 401);
 
   const id = Number(params.id);

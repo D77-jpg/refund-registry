@@ -80,6 +80,22 @@ function isNeonHttp(url: string): boolean {
 }
 
 /**
+ * 由连接串决定用哪条驱动。
+ *
+ * 默认策略：只要连接串是 Neon 系列就优先用 HTTP 驱动（Serverless 下最省连接）。
+ * 但可以通过环境变量强制走 TCP：
+ *   DB_FORCE_TCP=1     —— 强制用 postgres.js 走 TCP
+ *   DB_FORCE_HTTP=1    —— 强制用 Neon HTTP 驱动
+ * 排查「某个驱动读到陈旧数据」这类问题时，用它可以快速切换对比。
+ */
+export function resolvedDriver(url: string): 'neon-http' | 'postgres-tcp' | 'none' {
+  if (!url) return 'none';
+  if (process.env.DB_FORCE_TCP === '1') return 'postgres-tcp';
+  if (process.env.DB_FORCE_HTTP === '1') return 'neon-http';
+  return isNeonHttp(url) ? 'neon-http' : 'postgres-tcp';
+}
+
+/**
  * 读取连接串并清洗。
  * 环境变量在 Windows/某些平台被写入时可能带上 UTF-8 BOM（\uFEFF）或换行，
  * 这些不可见字符会让驱动报「不是合法的 URL」，所以统一在这里剥掉。
@@ -102,11 +118,17 @@ async function getClient(): Promise<SqlClient> {
   if (!clientPromise) {
     clientPromise = (async (): Promise<SqlClient> => {
       const url = databaseUrl();
+      const driver = resolvedDriver(url);
 
-      if (isNeonHttp(url)) {
+      if (driver === 'neon-http') {
         const mod: any = await import('@neondatabase/serverless');
-        // neon() 返回的是一个函数：sql(text, params) / sql`...`
-        const neonSql = mod.neon(url);
+        // 关键：Neon 的 HTTP 驱动底层用 fetch 发 SQL。若平台的 fetch 缓存层
+        // 缓存了这些响应，就会出现「写入成功、读取却一直是旧值」的陈旧读，
+        // 对退款核对是致命的（会把已退款的单当成待处理，导致重复打款）。
+        // 这里显式声明不缓存，并关掉驱动自身的查询结果缓存。
+        mod.neonConfig.fetchFunction = (input: any, init: any = {}) =>
+          fetch(input, { ...init, cache: 'no-store' });
+        const neonSql = mod.neon(url, { cache: false } as any);
         return {
           async query(text, values = []) {
             const rows = await neonSql(text, values as any[]);
@@ -502,6 +524,26 @@ export async function healthCheck(): Promise<{ ok: boolean; mode: string; detail
     };
   } catch (err: any) {
     // 注意：驱动报错时可能把完整连接串（含密码）带进 message，必须抹掉再往外返回
-    return { ok: false, mode: 'postgres', detail: `数据库连接失败：${redactUrl(err?.message || err)}` };
+    return { ok: false, mode: 'postgres', detail: `数据库连接失败：${redactUrl(err?.message || String(err))}` };
   }
+}
+
+/**
+ * 仅用于排查的诊断探针：返回数据层查询的**原始结构**。
+ * healthCheck 只读 rows[0].c，如果驱动返回的形状与预期不同，
+ * 就会出现「计数莫名其妙」的情况，这里把原始值原样暴露出来对照。
+ */
+export async function __probeRawCount(): Promise<any> {
+  await ensureSchema();
+  const client = await getClient();
+  const rows = (await client.query(`SELECT count(*)::int AS c FROM refunds`)) as any;
+  return {
+    isArray: Array.isArray(rows),
+    length: rows?.length,
+    first: rows?.[0],
+    keysOfFirst: rows?.[0] ? Object.keys(rows[0]) : null,
+    firstValue: rows?.[0]?.c,
+    typeofFirstValue: typeof rows?.[0]?.c,
+    stringified: JSON.stringify(rows)?.slice(0, 300)
+  };
 }

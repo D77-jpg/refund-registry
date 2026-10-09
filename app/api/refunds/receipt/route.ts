@@ -4,6 +4,7 @@ import { blobEnabled, extFromMime, receiptKey } from '@/lib/storage';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
+export const fetchCache = 'force-no-store';
 
 /** 收款码单张体积上限（未压缩前），与前端压缩后的实际体积相比留足余量 */
 const MAX_BYTES = 5 * 1024 * 1024;
@@ -25,7 +26,7 @@ function rateLimited(ip: string): boolean {
 /**
  * 上传收款码到对象存储（Vercel Blob）。
  *
- * 前端把压缩后的 JPEG 以 multipart/form-data 传来，避免走 base64 的 JSON 大包。
+ * 前端把压缩后的 JPEG 以 multipart/form-data 传来，避免走 base64 的大 JSON。
  * 这里只上传、不落库；真正的登记记录由 /api/refunds 写入，
  * 因此用户中途放弃时只会留下一个无人引用的对象，不影响业务数据一致性。
  */

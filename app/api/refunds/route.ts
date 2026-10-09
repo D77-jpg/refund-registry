@@ -6,6 +6,7 @@ import { deleteReceipt } from '@/lib/storage';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
+export const fetchCache = 'force-no-store';
 
 /**
  * 公开接口：用户提交退款登记。

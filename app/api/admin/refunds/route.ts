@@ -1,4 +1,5 @@
 import { NextRequest } from 'next/server';
+import { unstable_noStore as noStore } from 'next/cache';
 import { exportRefunds, listRefunds, updateRefundStatus, bulkUpdateStatus, deleteRefund, dbMode } from '@/lib/db';
 import { isAuthenticated } from '@/lib/auth';
 import { json, reasonLabel, statusLabel, toCsv, formatDateTime } from '@/lib/http';
@@ -6,6 +7,8 @@ import type { RefundStatus } from '@/lib/types';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
+// 后台列表/状态必须实时，否则会把已退款的单显示成待处理，导致重复打款
+export const fetchCache = 'force-no-store';
 
 const VALID_STATUS: RefundStatus[] = ['pending', 'refunded', 'rejected'];
 
@@ -16,6 +19,8 @@ function guard() {
 
 /** 列表 / 搜索 / 分页 / 导出 */
 export async function GET(req: NextRequest) {
+  // 退出 fetch 缓存：后台看到旧状态会导致重复打款
+  noStore();
   const denied = guard();
   if (denied) return denied;
 

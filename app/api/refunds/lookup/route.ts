@@ -1,4 +1,5 @@
 import { NextRequest } from 'next/server';
+import { unstable_noStore as noStore } from 'next/cache';
 import { findByOrderNo } from '@/lib/db';
 import { json } from '@/lib/http';
 import { maskContact, maskRedeemCode, normalizeContact, normalizeOrderNo } from '@/lib/validate';
@@ -6,12 +7,16 @@ import { REDEEM_STATE_LABEL, REFUND_STATUS_LABEL, type RedeemState, type RefundS
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
+// 用户查进度必须实时，缓存会导致状态显示滞后
+export const fetchCache = 'force-no-store';
 
 /**
  * 公开接口：用户凭「订单号 + 联系方式后 4 位」查询自己的退款进度。
  * 只返回脱敏后的必要字段，绝不返回收款码图片和完整联系方式。
  */
 export async function POST(req: NextRequest) {
+  // 退出 fetch 缓存，避免读到旧的退款状态
+  noStore();
   let body: any;
   try {
     body = await req.json();
