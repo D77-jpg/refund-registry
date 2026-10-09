@@ -1,6 +1,7 @@
 import { promises as fs } from 'fs';
 import path from 'path';
 import type { RefundRow, RefundStatus } from './types';
+import { deleteReceipt } from './storage';
 
 /**
  * 数据层。两种存储后端：
@@ -28,6 +29,8 @@ CREATE TABLE IF NOT EXISTS refunds (
   description   TEXT NOT NULL DEFAULT '',
   receipt_mime  TEXT NOT NULL DEFAULT '',
   receipt_data  TEXT NOT NULL DEFAULT '',
+  receipt_url   TEXT NOT NULL DEFAULT '',
+  receipt_pathname TEXT NOT NULL DEFAULT '',
   status        TEXT NOT NULL DEFAULT 'pending',
   admin_note    TEXT NOT NULL DEFAULT '',
   refund_ref    TEXT NOT NULL DEFAULT '',
@@ -41,6 +44,15 @@ CREATE TABLE IF NOT EXISTS refunds (
 const CREATE_INDEX_SQL = [
   `CREATE INDEX IF NOT EXISTS refunds_status_idx ON refunds (status)`,
   `CREATE INDEX IF NOT EXISTS refunds_created_idx ON refunds (created_at DESC)`
+];
+
+/**
+ * 结构升级语句。老版本的表缺少收款码对象存储相关的列，
+ * 这里用 ADD COLUMN IF NOT EXISTS 做幂等迁移，避免手工执行 SQL。
+ */
+const MIGRATION_SQL = [
+  `ALTER TABLE refunds ADD COLUMN IF NOT EXISTS receipt_url TEXT NOT NULL DEFAULT ''`,
+  `ALTER TABLE refunds ADD COLUMN IF NOT EXISTS receipt_pathname TEXT NOT NULL DEFAULT ''`
 ];
 
 export function dbMode(): 'postgres' | 'local-file' {
@@ -142,6 +154,9 @@ export function ensureSchema(): Promise<void> {
       for (const stmt of CREATE_INDEX_SQL) {
         await client.exec(stmt);
       }
+      for (const stmt of MIGRATION_SQL) {
+        await client.exec(stmt);
+      }
     })().catch((err) => {
       schemaReady = null;
       throw err;
@@ -219,6 +234,9 @@ export async function insertRefund(input: {
   redeem_state: string;
   description: string;
   receipt_mime: string;
+  /** 对象存储里的地址与对象键；为空则退回 receipt_data 存 base64 */
+  receipt_url: string;
+  receipt_pathname: string;
   receipt_data: string;
   ip: string;
   user_agent: string;
@@ -248,8 +266,9 @@ export async function insertRefund(input: {
   try {
     const rows = await client.query(
       `INSERT INTO refunds (order_no, redeem_code, contact, contact_type, contact_name, amount,
-                            reason_code, redeem_state, description, receipt_mime, receipt_data, ip, user_agent)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                            reason_code, redeem_state, description, receipt_mime, receipt_data,
+                            receipt_url, receipt_pathname, ip, user_agent)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
        RETURNING *`,
       [
         input.order_no,
@@ -263,6 +282,8 @@ export async function insertRefund(input: {
         input.description,
         input.receipt_mime,
         input.receipt_data,
+        input.receipt_url || '',
+        input.receipt_pathname || '',
         input.ip,
         input.user_agent
       ]
@@ -444,14 +465,22 @@ export async function deleteRefund(id: number): Promise<boolean> {
     const db = await localLoad();
     const idx = db.rows.findIndex((r) => r.id === id);
     if (idx < 0) return false;
-    db.rows.splice(idx, 1);
+    const [removed] = db.rows.splice(idx, 1);
     await localSave(db);
+    if (removed?.receipt_pathname) await deleteReceipt(removed.receipt_pathname);
     return true;
   }
   await ensureSchema();
   const client = await getClient();
-  const rows = await client.query(`DELETE FROM refunds WHERE id = $1 RETURNING id`, [id]);
-  return rows.length > 0;
+  // 先取出对象键，删完记录后把对象存储里的收款码一并清掉（避免敏感图片长期留存）
+  const rows = await client.query(
+    `DELETE FROM refunds WHERE id = $1 RETURNING id, receipt_pathname`,
+    [id]
+  );
+  if (rows.length === 0) return false;
+  const pathname = (rows[0] as any)?.receipt_pathname;
+  if (pathname) await deleteReceipt(pathname);
+  return true;
 }
 
 export async function healthCheck(): Promise<{ ok: boolean; mode: string; detail: string }> {

@@ -45,10 +45,64 @@ export interface ValidationResult {
   errors: string[];
   /** 归一化后的数据，ok 为 true 时可用 */
   value: RefundInput;
+  /** 收款码的 base64（走对象存储时为空，由调用方填写 receipt_url） */
+  receiptBase64: string;
+  receiptMime: string;
+}
+
+/** 收款码来源：对象存储地址 或 内联 base64（二选一） */
+export interface ParsedReceipt {
+  mode: 'blob' | 'base64';
+  url: string;
+  pathname: string;
+  mime: string;
+  data: string;
+}
+
+const BLOB_HOST_RE = /^https:\/\/[a-z0-9-]+\.public\.blob\.vercel-storage\.com\//i;
+
+/** 校验前端传来的对象存储地址，只接受本站 Blob 存储域名下的 https 地址 */
+export function parseReceiptUrl(raw: unknown): { url: string; pathname: string } | null {
+  const url = String(raw || '').trim();
+  if (!url || url.length > 500) return null;
+  if (!BLOB_HOST_RE.test(url)) return null;
+  let pathname = '';
+  try {
+    pathname = decodeURIComponent(new URL(url).pathname.replace(/^\//, ''));
+  } catch {
+    return null;
+  }
+  if (!/^receipts\/[a-f0-9]{32}-\d+\.(jpg|png|webp)$/.test(pathname)) return null;
+  return { url, pathname };
+}
+
+/**
+ * 校验收款码（base64 内联形式）。对象存储形式由 parseReceiptUrl 处理。
+ */
+export function parseReceipt(raw: unknown): { ok: true; value: ParsedReceipt } | { ok: false; error: string } {
+  const receipt = String(raw || '');
+  if (!receipt) return { ok: false, error: '请上传收款码截图（微信或支付宝）' };
+  const m = /^data:(image\/(?:png|jpeg|jpg|webp));base64,([A-Za-z0-9+/=\s]+)$/.exec(receipt);
+  if (!m) return { ok: false, error: '收款码图片格式不支持，请上传 png / jpg / webp 图片' };
+
+  const mime = m[1] === 'image/jpg' ? 'image/jpeg' : m[1];
+  const data = m[2].replace(/\s/g, '');
+  const bytes = Math.floor((data.length * 3) / 4);
+  if (bytes > MAX_RECEIPT_BYTES) {
+    return {
+      ok: false,
+      error: '收款码图片过大，请压缩到 3MB 以内（本页会自动压缩，若仍失败请换一张更小的截图）'
+    };
+  }
+  // 只挡明显异常的空/损坏图片；真实收款码截图压缩后通常 150KB 以上
+  if (bytes < 60) return { ok: false, error: '收款码图片内容异常，请重新上传' };
+
+  return { ok: true, value: { mode: 'base64', url: '', pathname: '', mime, data } };
 }
 
 /**
  * 服务端权威校验。前端也会做一遍，但后端绝不能信任前端。
+ * 收款码单独用 parseReceipt / parseReceiptUrl 校验，便于两种存储模式复用。
  */
 export function validateRefundInput(body: any): ValidationResult {
   const errors: string[] = [];
@@ -91,27 +145,16 @@ export function validateRefundInput(body: any): ValidationResult {
   const validRedeemStates = ['not_passed', 'processing', 'disabled', 'used', 'unknown'];
   if (!validRedeemStates.includes(redeem_state)) errors.push('请选择兑换码当前状态');
 
-  let receipt_mime = '';
-  let receipt_data = '';
-  const m = /^data:(image\/(?:png|jpeg|jpg|webp));base64,([A-Za-z0-9+/=\s]+)$/.exec(receipt);
-  if (!receipt) {
-    errors.push('请上传收款码截图（微信或支付宝）');
-  } else if (!m) {
-    errors.push('收款码图片格式不支持，请上传 png / jpg / webp 图片');
-  } else {
-    receipt_mime = m[1] === 'image/jpg' ? 'image/jpeg' : m[1];
-    receipt_data = m[2].replace(/\s/g, '');
-    const bytes = Math.floor((receipt_data.length * 3) / 4);
-    if (bytes > MAX_RECEIPT_BYTES) {
-      errors.push('收款码图片过大，请压缩到 3MB 以内（本页会自动压缩，若仍失败请换一张更小的截图）');
-    }
-    // 只挡明显异常的空/损坏图片；真实收款码截图压缩后通常 150KB 以上
-    if (bytes < 60) errors.push('收款码图片内容异常，请重新上传');
-  }
+  // 收款码有两种来源（对象存储地址 / 内联 base64），由路由层分流判断，这里不重复报错
+  const parsed = parseReceipt(receipt);
+  const receiptMime = parsed.ok ? parsed.value.mime : '';
+  const receiptBase64 = parsed.ok ? parsed.value.data : '';
 
   return {
     ok: errors.length === 0,
     errors,
+    receiptBase64,
+    receiptMime,
     value: {
       order_no,
       redeem_code,
@@ -121,8 +164,7 @@ export function validateRefundInput(body: any): ValidationResult {
       amount: amountNum === null ? '' : amountNum.toFixed(2),
       reason_code,
       redeem_state,
-      description,
-      receipt: receipt_mime && receipt_data ? `${receipt_mime}|${receipt_data}` : ''
+      description
     }
   };
 }

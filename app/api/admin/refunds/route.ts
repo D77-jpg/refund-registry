@@ -67,9 +67,10 @@ export async function GET(req: NextRequest) {
       ...result,
       mode: dbMode(),
       rows: result.rows.map((r) => {
-        // 列表不返回 base64 图片本体，避免响应过大；图片走 /api/admin/receipts/[id]
-        const { receipt_data, receipt_mime, ...rest } = r;
-        return { ...rest, has_receipt: Boolean(receipt_data && receipt_data.length > 0) };
+        // 列表不返回图片本体（base64 或对象存储地址），避免响应过大、也不泄露 Blob 地址；
+        // 图片统一走 /api/admin/receipts/[id]（需登录）
+        const { receipt_data, receipt_mime, receipt_url, receipt_pathname, ...rest } = r;
+        return { ...rest, has_receipt: Boolean(receipt_url || receipt_data) };
       })
     }
   });

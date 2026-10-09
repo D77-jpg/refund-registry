@@ -91,6 +91,52 @@ console.log(`\n▶ 目标 ${BASE}\n`);
   check('重复订单号被拦截(409)', res.status === 409 && json?.code === 'DUPLICATE_ORDER', JSON.stringify(json));
 }
 
+// 2.5 收款码对象存储路径：上传文件 -> 用返回地址登记 -> 后台能取到图
+{
+  const png = Buffer.from(PNG_1PX, 'base64');
+  const fd = new FormData();
+  fd.append('file', new Blob([png], { type: 'image/png' }), 'receipt.png');
+  const upRes = await fetch(`${BASE}/api/refunds/receipt`, { method: 'POST', body: fd });
+  const upJson = await upRes.json().catch(() => null);
+
+  if (upRes.status === 501 || upJson?.storage === 'database') {
+    console.log('  ⏭ 收款码对象存储未启用（本地无 BLOB_READ_WRITE_TOKEN），跳过该路径');
+  } else {
+    check('收款码上传到对象存储成功', upRes.ok && upJson?.ok === true, JSON.stringify(upJson).slice(0, 200));
+    const blobUrl = upJson?.data?.url || '';
+    check(
+      '返回的地址是对象存储域名',
+      /^https:\/\/[a-z0-9-]+\.public\.blob\.vercel-storage\.com\/receipts\//i.test(blobUrl),
+      blobUrl
+    );
+
+    // 用对象存储地址登记一单
+    const orderNo2 = `LD26SMOKE${String(Date.now()).slice(-6)}B`;
+    const body2 = { ...payload, order_no: orderNo2, receipt: '', receipt_url: blobUrl, contact: 'smokeblob_wx_7788' };
+    const { res: res2, json: json2 } = await post('/api/refunds', body2);
+    check('用对象存储地址登记成功', res2.ok && json2?.ok === true, JSON.stringify(json2).slice(0, 200));
+
+    // 登录后查看该记录的收款码
+    const login = await post('/api/admin/session', { password: PASSWORD });
+    check('对象存储路径：登录成功', login.res.ok && login.json?.ok === true);
+    const listRes = await fetch(`${BASE}/api/admin/refunds?status=all&q=${orderNo2}`, {
+      headers: { cookie: cookieHeader() }
+    });
+    const listJson = await listRes.json();
+    const row2 = listJson?.data?.rows?.find((r) => r.order_no === orderNo2);
+    check('后台列表含 has_receipt 标记', row2?.has_receipt === true, String(row2?.has_receipt));
+    check('列表不泄露 Blob 地址', row2 && row2.receipt_url === undefined, JSON.stringify(row2 || {}).slice(0, 120));
+
+    if (row2?.id) {
+      const imgRes = await fetch(`${BASE}/api/admin/receipts/${row2.id}`, { headers: { cookie: cookieHeader() } });
+      const buf = Buffer.from(await imgRes.arrayBuffer());
+      check('后台能取到对象存储里的收款码', imgRes.ok && buf.length > 0, `status=${imgRes.status} bytes=${buf.length}`);
+      const anon = await fetch(`${BASE}/api/admin/receipts/${row2.id}`);
+      check('未登录无法取收款码(401)', anon.status === 401, `status=${anon.status}`);
+    }
+  }
+}
+
 // 3. 参数校验
 {
   const { res, json } = await post('/api/refunds', { ...payload, order_no: 'XX123', contact: '' });

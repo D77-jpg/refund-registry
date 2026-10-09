@@ -76,7 +76,12 @@ export interface RefundRow {
   redeem_state: string;
   description: string;
   receipt_mime: string;
+  /** 退回数据库模式时的 base64 图片数据；用对象存储时为空 */
   receipt_data: string;
+  /** 对象存储（Vercel Blob）里的收款码地址；为空表示存在数据库里 */
+  receipt_url: string;
+  /** 对象存储里的对象键，用于删除文件 */
+  receipt_pathname: string;
   status: RefundStatus;
   admin_note: string;
   refund_ref: string;
@@ -87,7 +92,7 @@ export interface RefundRow {
   refunded_at: string | null;
 }
 
-/** 用户端可提交的字段 */
+/** 用户端可提交的字段（收款码由路由层按来源分别处理后入库） */
 export interface RefundInput {
   order_no: string;
   redeem_code: string;
@@ -98,5 +103,4 @@ export interface RefundInput {
   reason_code: string;
   redeem_state: string;
   description: string;
-  receipt: string;
 }

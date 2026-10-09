@@ -1,7 +1,8 @@
 import { NextRequest } from 'next/server';
 import { DuplicateOrderError, insertRefund } from '@/lib/db';
-import { validateRefundInput } from '@/lib/validate';
+import { parseReceipt, parseReceiptUrl, validateRefundInput } from '@/lib/validate';
 import { clientIp, json } from '@/lib/http';
+import { deleteReceipt } from '@/lib/storage';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -49,7 +50,21 @@ export async function POST(req: NextRequest) {
     return json({ ok: false, errors: result.errors }, 400);
   }
 
-  const [receipt_mime, receipt_data] = result.value.receipt.split('|');
+  // 收款码优先用对象存储地址（前端已单独上传），否则退回内联 base64
+  const fromBlob = parseReceiptUrl(body?.receipt_url);
+  const receipt_url = fromBlob?.url || '';
+  const receipt_pathname = fromBlob?.pathname || '';
+  const receipt_data = fromBlob ? '' : result.receiptBase64;
+  const receipt_mime = fromBlob ? 'image/jpeg' : result.receiptMime;
+
+  if (!fromBlob && !receipt_data) {
+    // 既没有合法的对象存储地址，也没有合法的 base64 图片，把具体原因告诉用户
+    const why = parseReceipt(body?.receipt);
+    return json(
+      { ok: false, errors: [why.ok ? '请上传收款码截图（微信或支付宝）' : why.error] },
+      400
+    );
+  }
 
   try {
     const row = await insertRefund({
@@ -64,6 +79,8 @@ export async function POST(req: NextRequest) {
       description: result.value.description,
       receipt_mime,
       receipt_data,
+      receipt_url,
+      receipt_pathname,
       ip,
       user_agent: (req.headers.get('user-agent') || '').slice(0, 300)
     });
@@ -77,6 +94,9 @@ export async function POST(req: NextRequest) {
       }
     });
   } catch (err: any) {
+    // 登记没有落库时，把已经上传的收款码清掉，避免对象存储里堆无人引用的敏感图片
+    if (receipt_pathname) await deleteReceipt(receipt_pathname);
+
     if (err instanceof DuplicateOrderError) {
       return json(
         {

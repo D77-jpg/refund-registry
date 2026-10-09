@@ -49,8 +49,9 @@ export default function RefundForm({
   supportContact: string;
 }) {
   const [form, setForm] = useState<FormState>(INITIAL);
-  const [receipt, setReceipt] = useState<{ dataUrl: string; bytes: number } | null>(null);
+  const [receipt, setReceipt] = useState<{ dataUrl: string; bytes: number; url?: string } | null>(null);
   const [receiptBusy, setReceiptBusy] = useState(false);
+  const [uploadNote, setUploadNote] = useState('');
   const [errors, setErrors] = useState<string[]>([]);
   const [submitting, setSubmitting] = useState(false);
   const [done, setDone] = useState<{ order_no: string; created_at: string } | null>(null);
@@ -79,12 +80,33 @@ export default function RefundForm({
     if (!file) return;
     setErrors([]);
     setReceiptBusy(true);
+    setUploadNote('正在压缩图片…');
     try {
       const res = await compressImage(file);
       setReceipt({ dataUrl: res.dataUrl, bytes: res.bytes });
+
+      // 压缩后直接传到对象存储（Vercel Blob），避免把大段 base64 塞进提交请求。
+      // 上传失败不影响用户：后续提交会自动退回「随表单提交 base64」的方式。
+      setUploadNote('正在上传收款码…');
+      try {
+        const blob = await (await fetch(res.dataUrl)).blob();
+        const fd = new FormData();
+        fd.append('file', blob, 'receipt.jpg');
+        const up = await fetch('/api/refunds/receipt', { method: 'POST', body: fd });
+        const upJson = await up.json().catch(() => null);
+        if (up.ok && upJson?.ok && upJson.data?.url) {
+          setReceipt({ dataUrl: res.dataUrl, bytes: res.bytes, url: upJson.data.url });
+          setUploadNote(`已上传（压缩后 ${humanSize(res.bytes)}）`);
+        } else {
+          setUploadNote(`已选择，压缩后 ${humanSize(res.bytes)}（提交时一并上传）`);
+        }
+      } catch {
+        setUploadNote(`已选择，压缩后 ${humanSize(res.bytes)}（提交时一并上传）`);
+      }
     } catch (err: any) {
       setErrors([err?.message || '图片处理失败，请重新选择']);
       setReceipt(null);
+      setUploadNote('');
     } finally {
       setReceiptBusy(false);
     }
@@ -131,7 +153,9 @@ export default function RefundForm({
           order_no: orderNo,
           redeem_code: code,
           amount: form.amount,
-          receipt: receipt!.dataUrl,
+          // 已上传到对象存储就只传地址，否则退回内联 base64
+          receipt_url: receipt!.url || '',
+          receipt: receipt!.url ? '' : receipt!.dataUrl,
           __hp: honeyRef.current?.value || ''
         })
       });
@@ -411,8 +435,18 @@ export default function RefundForm({
                   alt="收款码预览"
                   className="mx-auto max-h-56 rounded-lg border border-slate-200 bg-white object-contain"
                 />
-                <p className="text-xs text-slate-500">已选择，压缩后 {humanSize(receipt.bytes)}</p>
-                <button type="button" className="btn-ghost" onClick={() => fileRef.current?.click()}>
+                <p className="text-xs text-slate-500">
+                  {uploadNote || `已选择，压缩后 ${humanSize(receipt.bytes)}`}
+                </p>
+                <button
+                  type="button"
+                  className="btn-ghost"
+                  onClick={() => {
+                    setReceipt(null);
+                    setUploadNote('');
+                    fileRef.current?.click();
+                  }}
+                >
                   重新选择
                 </button>
               </div>
