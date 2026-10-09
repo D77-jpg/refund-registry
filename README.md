@@ -35,16 +35,26 @@
 npm install
 npm run build
 npm start                 # http://127.0.0.1:3000
-node scripts/smoke.mjs    # 30 项端到端接口自测
-node scripts/page-check.mjs   # 页面渲染与关键文案检查（21 项）
-node scripts/visual-check.mjs # 无头浏览器布局体检 + 截图（26 项，需 playwright）
+node scripts/smoke.mjs             # 30 项端到端接口自测
+node scripts/check-consistency.mjs # 12 项数据一致性回归（防缓存陈旧读）
+node scripts/check-mojibake.mjs    # 源码乱码检查
+node scripts/page-check.mjs        # 页面渲染与关键文案检查（21 项）
+node scripts/visual-check.mjs      # 无头浏览器布局体检 + 截图（26 项，需 playwright）
 ```
 
 未配置 `DATABASE_URL` 时数据存在 `data/refunds.json`（仅本机测试）。配置后自动走 PostgreSQL 并自动建表。
 未配置 `BLOB_READ_WRITE_TOKEN` 时收款码以 base64 存数据库；线上由 Vercel Blob 承载。
 
-维护脚本：`delete-record.mjs`（按编号/前缀删记录）、`cleanup-blob-orphans.mjs`（清理孤儿图片）、
-`seed-visual-data.mjs`（造视觉检查假数据）、`make-fake-qr.mjs`（生成仿真二维码图）。
+维护脚本：`delete-record.mjs`（按编号/前缀删记录）、`list-records.mjs`（列出全部记录）、
+`cleanup-blob-orphans.mjs`（清理孤儿图片）、`seed-visual-data.mjs`（造视觉检查假数据）、
+`make-fake-qr.mjs`（生成仿真二维码图）、`strip-bom.mjs`（去 BOM）。
+
+## 已知限制
+
+`*.vercel.app` 域名在中国大陆网络下经常无法访问（[Vercel 官方也有说明](https://vercel.com/kb/guide/accessing-vercel-hosted-sites-from-mainland-china)），
+手机用户可能打不开页面。要给国内用户稳定使用，需要绑定自己的域名或改用国内可访问的部署方式。
+请注意：**在 Windows 上用 PowerShell 就地改写文件会破坏中文并写入 BOM**，本项目已因此踩坑两次，
+改文件请用编辑器，并跑 `node scripts/check-mojibake.mjs` 兜底。
 
 ## 重新部署
 
