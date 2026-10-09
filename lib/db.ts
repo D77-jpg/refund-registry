@@ -3,12 +3,12 @@ import path from 'path';
 import type { RefundRow, RefundStatus } from './types';
 
 /**
- * 数据层。两种后端：
+ * 数据层。两种存储后端：
  *
  * 1) PostgreSQL（线上正式用法）：配置 DATABASE_URL 即启用。
  *    - Neon / Vercel Postgres：走 HTTP 驱动（@neondatabase/serverless），Serverless 友好
- *    - Supabase / 其他：走 postgres 驱动的 TCP 连接池
- *    - 建表由应用自动完成，不需要手工执行 SQL
+ *    - Supabase / 其他 Postgres：走 postgres 驱动的 TCP 连接池
+ *    - 建表由应用首次访问时自动完成，不需要手工执行 SQL
  *
  * 2) 本地 JSON 文件（仅本机测试兜底）：未配置 DATABASE_URL 时启用。
  *    ⚠️ Vercel 等 Serverless 环境文件系统只读，线上必须配置 DATABASE_URL。
@@ -48,44 +48,99 @@ export function dbMode(): 'postgres' | 'local-file' {
 }
 
 /* ------------------------------------------------------------------ */
-/* PostgreSQL                                                          */
+/* PostgreSQL：统一的 SQL 适配层                                        */
 /* ------------------------------------------------------------------ */
 
-type SqlTag = (strings: TemplateStringsArray, ...values: any[]) => Promise<any[]>;
+/**
+ * 两种驱动（Neon HTTP / postgres.js TCP）的调用签名不同，
+ * 这里统一成 query(text, values) 与 exec(text)，其余业务代码不关心底层是谁。
+ */
+interface SqlClient {
+  /** 参数化查询，返回行数组 */
+  query(text: string, values?: unknown[]): Promise<any[]>;
+  /** 执行 DDL / 多语句，无返回值 */
+  exec(text: string): Promise<void>;
+}
 
-/** Neon 与其托管的 Vercel Postgres 支持 HTTP 驱动；其他厂商走 TCP 连接池 */
+/** Neon 及 Vercel Postgres 走 HTTP 驱动；其他厂商（Supabase 等）走 TCP 连接池 */
 function isNeonHttp(url: string): boolean {
   return /neon\.tech|neon\.build|vercel-storage\.com|\.neon\./i.test(url);
 }
 
-let sqlPromise: Promise<SqlTag> | null = null;
+/**
+ * 读取连接串并清洗。
+ * 环境变量在 Windows/某些平台被写入时可能带上 UTF-8 BOM（\uFEFF）或换行，
+ * 这些不可见字符会让驱动报「不是合法的 URL」，所以统一在这里剥掉。
+ */
+function databaseUrl(): string {
+  const raw = process.env.DATABASE_URL || '';
+  return raw.replace(/^\uFEFF/, '').replace(/[\r\n\t]/g, '').trim();
+}
 
-async function getSql(): Promise<SqlTag> {
-  if (!sqlPromise) {
-    sqlPromise = (async () => {
-      const url = process.env.DATABASE_URL as string;
+/** 日志/接口输出用：抹掉连接串里的密码，避免泄露 */
+export function redactUrl(text: string): string {
+  return String(text || '')
+    .replace(/:\/\/([^:@/\s]+):([^@/\s]+)@/g, '://$1:***@')
+    .replace(/password=\S+/gi, 'password=***');
+}
+
+let clientPromise: Promise<SqlClient> | null = null;
+
+async function getClient(): Promise<SqlClient> {
+  if (!clientPromise) {
+    clientPromise = (async (): Promise<SqlClient> => {
+      const url = databaseUrl();
+
       if (isNeonHttp(url)) {
         const mod: any = await import('@neondatabase/serverless');
-        return mod.neon(url) as SqlTag;
+        // neon() 返回的是一个函数：sql(text, params) / sql`...`
+        const neonSql = mod.neon(url);
+        return {
+          async query(text, values = []) {
+            const rows = await neonSql(text, values as any[]);
+            return (rows as any[]) || [];
+          },
+          async exec(text) {
+            await neonSql(text, []);
+          }
+        };
       }
+
       const mod: any = await import('postgres');
-      const pg = (mod.default ?? mod)(url, { max: 3, idle_timeout: 20, prepare: false });
-      return pg as unknown as SqlTag;
-    })();
+      const pg = (mod.default ?? mod)(url, {
+        max: 3,
+        idle_timeout: 20,
+        // Supabase 等连接池（PgBouncer）不支持预处理语句
+        prepare: false
+      });
+      return {
+        async query(text, values = []) {
+          const rows = await pg.unsafe(text, values as any[]);
+          return (rows as any[]) || [];
+        },
+        async exec(text) {
+          await pg.unsafe(text);
+        }
+      };
+    })().catch((err) => {
+      clientPromise = null;
+      throw err;
+    });
   }
-  return sqlPromise;
+  return clientPromise;
 }
 
 let schemaReady: Promise<void> | null = null;
 
+/** 首次访问时自动建表建索引，幂等 */
 export function ensureSchema(): Promise<void> {
   if (dbMode() === 'local-file') return Promise.resolve();
   if (!schemaReady) {
     schemaReady = (async () => {
-      const sql: any = await getSql();
-      await sql.unsafe(CREATE_TABLE_SQL);
+      const client = await getClient();
+      await client.exec(CREATE_TABLE_SQL);
       for (const stmt of CREATE_INDEX_SQL) {
-        await sql.unsafe(stmt);
+        await client.exec(stmt);
       }
     })().catch((err) => {
       schemaReady = null;
@@ -153,23 +208,21 @@ export class DuplicateOrderError extends Error {
 }
 
 /** 新建登记记录；订单号重复时抛 DuplicateOrderError */
-export async function insertRefund(
-  input: {
-    order_no: string;
-    redeem_code: string;
-    contact: string;
-    contact_type: string;
-    contact_name: string;
-    amount: string;
-    reason_code: string;
-    redeem_state: string;
-    description: string;
-    receipt_mime: string;
-    receipt_data: string;
-    ip: string;
-    user_agent: string;
-  }
-): Promise<RefundRow> {
+export async function insertRefund(input: {
+  order_no: string;
+  redeem_code: string;
+  contact: string;
+  contact_type: string;
+  contact_name: string;
+  amount: string;
+  reason_code: string;
+  redeem_state: string;
+  description: string;
+  receipt_mime: string;
+  receipt_data: string;
+  ip: string;
+  user_agent: string;
+}): Promise<RefundRow> {
   if (dbMode() === 'local-file') {
     const db = await localLoad();
     if (db.rows.some((r) => r.order_no === input.order_no)) throw new DuplicateOrderError();
@@ -190,18 +243,30 @@ export async function insertRefund(
   }
 
   await ensureSchema();
-  const sql = await getSql();
-  const existing = await sql`SELECT id FROM refunds WHERE order_no = ${input.order_no} LIMIT 1`;
-  if (existing.length > 0) throw new DuplicateOrderError();
+  const client = await getClient();
 
   try {
-    const rows = await sql`
-      INSERT INTO refunds (order_no, redeem_code, contact, contact_type, contact_name, amount,
-                           reason_code, redeem_state, description, receipt_mime, receipt_data, ip, user_agent)
-      VALUES (${input.order_no}, ${input.redeem_code}, ${input.contact}, ${input.contact_type},
-              ${input.contact_name}, ${input.amount}, ${input.reason_code}, ${input.redeem_state},
-              ${input.description}, ${input.receipt_mime}, ${input.receipt_data}, ${input.ip}, ${input.user_agent})
-      RETURNING *`;
+    const rows = await client.query(
+      `INSERT INTO refunds (order_no, redeem_code, contact, contact_type, contact_name, amount,
+                            reason_code, redeem_state, description, receipt_mime, receipt_data, ip, user_agent)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+       RETURNING *`,
+      [
+        input.order_no,
+        input.redeem_code,
+        input.contact,
+        input.contact_type,
+        input.contact_name,
+        input.amount,
+        input.reason_code,
+        input.redeem_state,
+        input.description,
+        input.receipt_mime,
+        input.receipt_data,
+        input.ip,
+        input.user_agent
+      ]
+    );
     return rows[0] as RefundRow;
   } catch (err: any) {
     if (err && (err.code === '23505' || /duplicate key/i.test(String(err.message)))) {
@@ -211,15 +276,15 @@ export async function insertRefund(
   }
 }
 
-/** 按订单号查询（含校验联系方式），用于用户自助查询进度 */
+/** 按订单号查询，用于用户自助查询进度 */
 export async function findByOrderNo(orderNo: string): Promise<RefundRow | null> {
   if (dbMode() === 'local-file') {
     const db = await localLoad();
     return db.rows.find((r) => r.order_no === orderNo) || null;
   }
   await ensureSchema();
-  const sql = await getSql();
-  const rows = await sql`SELECT * FROM refunds WHERE order_no = ${orderNo} LIMIT 1`;
+  const client = await getClient();
+  const rows = await client.query(`SELECT * FROM refunds WHERE order_no = $1 LIMIT 1`, [orderNo]);
   return (rows[0] as RefundRow) || null;
 }
 
@@ -229,8 +294,8 @@ export async function getRefundById(id: number): Promise<RefundRow | null> {
     return db.rows.find((r) => r.id === id) || null;
   }
   await ensureSchema();
-  const sql = await getSql();
-  const rows = await sql`SELECT * FROM refunds WHERE id = ${id} LIMIT 1`;
+  const client = await getClient();
+  const rows = await client.query(`SELECT * FROM refunds WHERE id = $1 LIMIT 1`, [id]);
   return (rows[0] as RefundRow) || null;
 }
 
@@ -269,25 +334,22 @@ export async function listRefunds(query: ListQuery): Promise<ListResult> {
   }
 
   await ensureSchema();
-  const sql = await getSql();
+  const client = await getClient();
   const like = `%${q}%`;
-  const rows = await sql`
-    SELECT * FROM refunds
-    WHERE (${status} = '' OR status = ${status})
-      AND (${reason} = '' OR reason_code = ${reason})
-      AND (${q} = '' OR order_no ILIKE ${like} OR redeem_code ILIKE ${like}
-           OR contact ILIKE ${like} OR contact_name ILIKE ${like} OR description ILIKE ${like})
-    ORDER BY created_at DESC
-    LIMIT ${pageSize} OFFSET ${(page - 1) * pageSize}`;
+  const where = `($1 = '' OR status = $1)
+      AND ($2 = '' OR reason_code = $2)
+      AND ($3 = '' OR order_no ILIKE $4 OR redeem_code ILIKE $4
+           OR contact ILIKE $4 OR contact_name ILIKE $4 OR description ILIKE $4)`;
+  const base = [status, reason, q, like];
 
-  const countRows = await sql`
-    SELECT count(*)::int AS total FROM refunds
-    WHERE (${status} = '' OR status = ${status})
-      AND (${reason} = '' OR reason_code = ${reason})
-      AND (${q} = '' OR order_no ILIKE ${like} OR redeem_code ILIKE ${like}
-           OR contact ILIKE ${like} OR contact_name ILIKE ${like} OR description ILIKE ${like})`;
+  const rows = await client.query(
+    `SELECT * FROM refunds WHERE ${where} ORDER BY created_at DESC LIMIT $5 OFFSET $6`,
+    [...base, pageSize, (page - 1) * pageSize]
+  );
 
-  const statRows = await sql`SELECT status, count(*)::int AS c FROM refunds GROUP BY status`;
+  const countRows = await client.query(`SELECT count(*)::int AS total FROM refunds WHERE ${where}`, base);
+
+  const statRows = await client.query(`SELECT status, count(*)::int AS c FROM refunds GROUP BY status`);
   const stats: Record<string, number> = { all: 0, pending: 0, refunded: 0, rejected: 0 };
   for (const r of statRows as any[]) {
     stats[r.status] = Number(r.c);
@@ -334,16 +396,18 @@ export async function updateRefundStatus(
   }
 
   await ensureSchema();
-  const sql = await getSql();
-  const rows = await sql`
-    UPDATE refunds SET
-      status = ${patch.status},
-      admin_note = COALESCE(${patch.admin_note ?? null}, admin_note),
-      refund_ref = COALESCE(${patch.refund_ref ?? null}, refund_ref),
-      updated_at = now(),
-      refunded_at = CASE WHEN ${patch.status} = 'refunded' THEN now() ELSE NULL END
-    WHERE id = ${id}
-    RETURNING *`;
+  const client = await getClient();
+  const rows = await client.query(
+    `UPDATE refunds SET
+       status = $2,
+       admin_note = COALESCE($3, admin_note),
+       refund_ref = COALESCE($4, refund_ref),
+       updated_at = now(),
+       refunded_at = CASE WHEN $2 = 'refunded' THEN now() ELSE NULL END
+     WHERE id = $1
+     RETURNING *`,
+    [id, patch.status, patch.admin_note ?? null, patch.refund_ref ?? null]
+  );
   return (rows[0] as RefundRow) || null;
 }
 
@@ -361,15 +425,17 @@ export async function bulkUpdateStatus(
     return n;
   }
   await ensureSchema();
-  const sql = await getSql();
-  const rows = await sql`
-    UPDATE refunds SET
-      status = ${patch.status},
-      admin_note = COALESCE(${patch.admin_note ?? null}, admin_note),
-      updated_at = now(),
-      refunded_at = CASE WHEN ${patch.status} = 'refunded' THEN now() ELSE NULL END
-    WHERE id = ANY(${ids})
-    RETURNING id`;
+  const client = await getClient();
+  const rows = await client.query(
+    `UPDATE refunds SET
+       status = $2,
+       admin_note = COALESCE($3, admin_note),
+       updated_at = now(),
+       refunded_at = CASE WHEN $2 = 'refunded' THEN now() ELSE NULL END
+     WHERE id = ANY($1::int[])
+     RETURNING id`,
+    [ids, patch.status, patch.admin_note ?? null]
+  );
   return rows.length;
 }
 
@@ -383,21 +449,30 @@ export async function deleteRefund(id: number): Promise<boolean> {
     return true;
   }
   await ensureSchema();
-  const sql = await getSql();
-  const rows = await sql`DELETE FROM refunds WHERE id = ${id} RETURNING id`;
+  const client = await getClient();
+  const rows = await client.query(`DELETE FROM refunds WHERE id = $1 RETURNING id`, [id]);
   return rows.length > 0;
 }
 
 export async function healthCheck(): Promise<{ ok: boolean; mode: string; detail: string }> {
   if (dbMode() === 'local-file') {
-    return { ok: true, mode: 'local-file', detail: '本地文件存储（仅限本机测试，线上请配置 DATABASE_URL）' };
+    return {
+      ok: true,
+      mode: 'local-file',
+      detail: '本地文件存储（仅限本机测试，线上请配置 DATABASE_URL）'
+    };
   }
   try {
     await ensureSchema();
-    const sql = await getSql();
-    const rows = await sql`SELECT count(*)::int AS c FROM refunds`;
-    return { ok: true, mode: 'postgres', detail: `已连接云数据库，当前 ${(rows[0] as any).c} 条登记记录` };
+    const client = await getClient();
+    const rows = await client.query(`SELECT count(*)::int AS c FROM refunds`);
+    return {
+      ok: true,
+      mode: 'postgres',
+      detail: `已连接云数据库，当前 ${(rows[0] as any).c} 条登记记录`
+    };
   } catch (err: any) {
-    return { ok: false, mode: 'postgres', detail: `数据库连接失败：${err?.message || err}` };
+    // 注意：驱动报错时可能把完整连接串（含密码）带进 message，必须抹掉再往外返回
+    return { ok: false, mode: 'postgres', detail: `数据库连接失败：${redactUrl(err?.message || err)}` };
   }
 }
