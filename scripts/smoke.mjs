@@ -131,6 +131,13 @@ console.log(`\n▶ 目标 ${BASE}\n`);
       const imgRes = await fetch(`${BASE}/api/admin/receipts/${row2.id}`, { headers: { cookie: cookieHeader() } });
       const buf = Buffer.from(await imgRes.arrayBuffer());
       check('后台能取到对象存储里的收款码', imgRes.ok && buf.length > 0, `status=${imgRes.status} bytes=${buf.length}`);
+      // 校验返回的确实是图片内容（PNG 魔术字节），而不是错误 JSON
+      const isPng = buf.subarray(0, 8).toString('hex') === '89504e470d0a1a0a';
+      check(
+        '取回的收款码是有效图片内容',
+        isPng && /image\//.test(imgRes.headers.get('content-type') || ''),
+        `ctype=${imgRes.headers.get('content-type')} head=${buf.subarray(0, 4).toString('hex')}`
+      );
       const anon = await fetch(`${BASE}/api/admin/receipts/${row2.id}`);
       check('未登录无法取收款码(401)', anon.status === 401, `status=${anon.status}`);
     }

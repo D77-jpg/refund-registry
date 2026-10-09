@@ -6,7 +6,7 @@ export const metadata = {
 
 export default function QueryPage() {
   return (
-    <main className="px-4 py-6 sm:py-10">
+    <main className="px-4 py-6 sm:px-6 sm:py-8">
       <QueryForm />
     </main>
   );

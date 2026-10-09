@@ -35,11 +35,16 @@
 npm install
 npm run build
 npm start                 # http://127.0.0.1:3000
-node scripts/smoke.mjs    # 21 项端到端接口自测
+node scripts/smoke.mjs    # 30 项端到端接口自测
+node scripts/page-check.mjs   # 页面渲染与关键文案检查（21 项）
+node scripts/visual-check.mjs # 无头浏览器布局体检 + 截图（26 项，需 playwright）
 ```
 
 未配置 `DATABASE_URL` 时数据存在 `data/refunds.json`（仅本机测试）。配置后自动走 PostgreSQL 并自动建表。
 未配置 `BLOB_READ_WRITE_TOKEN` 时收款码以 base64 存数据库；线上由 Vercel Blob 承载。
+
+维护脚本：`delete-record.mjs`（按编号/前缀删记录）、`cleanup-blob-orphans.mjs`（清理孤儿图片）、
+`seed-visual-data.mjs`（造视觉检查假数据）、`make-fake-qr.mjs`（生成仿真二维码图）。
 
 ## 重新部署
 

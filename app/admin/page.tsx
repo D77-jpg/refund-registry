@@ -9,7 +9,7 @@ export default function AdminPage() {
   if (!isAuthenticated()) redirect('/admin/login');
   const usingDefaultPassword = !process.env.ADMIN_PASSWORD;
   return (
-    <main className="px-3 py-5 sm:px-6 sm:py-8">
+    <main className="px-4 py-5 sm:px-6 sm:py-7">
       <AdminWorkbench usingDefaultPassword={usingDefaultPassword} />
     </main>
   );
